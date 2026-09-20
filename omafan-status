@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+#
+# omafan-status — one line of JSON describing the fan right now.
+#
+# The bar polls this. It reads only world-readable sysfs, so it needs no root
+# and no running daemon; with the service stopped it still reports the real
+# temperature and RPM, which is what makes the bar useful before install.
+
+set -uo pipefail
+
+SMC=""
+for d in /sys/devices/platform/applesmc.*; do
+  [[ -e "$d/fan1_min" ]] && { SMC="$d"; break; }
+done
+
+if [[ -z $SMC ]]; then
+  printf '{"supported":false}\n'
+  exit 0
+fi
+
+temp=0
+for h in /sys/class/hwmon/hwmon*; do
+  [[ "$(cat "$h/name" 2>/dev/null)" == "coretemp" ]] || continue
+  for t in "$h"/temp*_input; do
+    [[ -e "$t" ]] || continue
+    [[ "$(cat "${t%_input}_label" 2>/dev/null)" == Package* ]] || continue
+    v=$(( $(cat "$t") / 1000 )); (( v > temp )) && temp=$v
+  done
+done
+for t in "$SMC"/temp*_input; do
+  [[ -e "$t" ]] || continue
+  case "$(cat "${t%_input}_label" 2>/dev/null)" in
+    TCGC*|TCXC*|TCMX*) v=$(( $(cat "$t") / 1000 )); (( v > temp )) && temp=$v ;;
+  esac
+done
+
+service=absent
+stock=""
+UNIT=/etc/systemd/system/omafan.service
+if [[ -f $UNIT ]]; then
+  service=inactive
+  systemctl is-active --quiet omafan.service 2>/dev/null && service=active
+  # fan1_min is where omafan writes, so once the daemon is running it no longer
+  # reports the factory floor. The installer recorded that in the unit.
+  stock="$(sed -n '/^Environment=OMAFAN_STOCK_MIN=/{s///p;q}' "$UNIT")"
+fi
+[[ "$stock" =~ ^[0-9]+$ ]] || stock="$(cat "$SMC/fan1_min" 2>/dev/null || echo 0)"
+
+printf '{"supported":true,"temp":%s,"rpm":%s,"floor":%s,"min":%s,"max":%s,"manual":%s,"service":"%s"}\n' \
+  "$temp" \
+  "$(cat "$SMC/fan1_input" 2>/dev/null || echo 0)" \
+  "$(cat "$SMC/fan1_min" 2>/dev/null || echo 0)" \
+  "$stock" \
+  "$(cat "$SMC/fan1_max" 2>/dev/null || echo 0)" \
+  "$(cat "$SMC/fan1_manual" 2>/dev/null || echo 0)" \
+  "$service"

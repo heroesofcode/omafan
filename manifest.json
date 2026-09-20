@@ -1,0 +1,100 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.heroesofcode.omafan",
+  "name": "Omafan",
+  "version": "1.0.0",
+  "author": "heroesofcode",
+  "license": "MIT",
+  "description": "Temperature-driven fan control for Apple hardware running Linux, from the Omarchy bar. The SMC's own curve barely ramps under Linux — on a MacBookAir7,2 the CPU reaches 90°C with the fan still idling at 1200 RPM. Omafan raises the fan's floor as the machine heats up, and shows the temperature in the bar.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Omafan",
+    "description": "Watch the CPU temperature in the bar and set the curve that drives the fan: where the ramp starts, where it reaches full speed, and how eagerly it comes back down.",
+    "category": "System",
+    "aliases": [
+      "fan",
+      "fans",
+      "ventoinha",
+      "temperature",
+      "temperatura",
+      "thermal",
+      "cooling",
+      "cpu",
+      "heat",
+      "smc",
+      "applesmc",
+      "macbook",
+      "rpm"
+    ],
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "enabled": true,
+      "tempLow": 65,
+      "tempHigh": 92,
+      "rpmMin": 1200,
+      "rpmMax": 6500,
+      "hysteresis": 8,
+      "interval": 5
+    },
+    "schema": [
+      {
+        "key": "enabled",
+        "type": "boolean",
+        "label": "Fan control enabled",
+        "defaultValue": true,
+        "description": "Turn the curve off and hand the fan back to the SMC's own control, without uninstalling the service. Right-clicking the bar icon toggles this too."
+      },
+      {
+        "key": "tempLow",
+        "type": "integer",
+        "label": "Start ramping at (°C)",
+        "defaultValue": 65,
+        "minimum": 30,
+        "maximum": 99,
+        "description": "Below this the fan is left at its factory floor and the machine is silent. The default sits just above where this class of machine rests, so the fan stays quiet during ordinary use and starts working as soon as the temperature is genuinely climbing."
+      },
+      {
+        "key": "tempHigh",
+        "type": "integer",
+        "label": "Full speed at (°C)",
+        "defaultValue": 92,
+        "minimum": 31,
+        "maximum": 100,
+        "description": "At or above this the floor is the maximum speed. The default leaves 13°C of headroom under the 105°C at which the CPU throttles itself, so the fan is already at full speed before anything is in trouble."
+      },
+      {
+        "key": "rpmMax",
+        "type": "integer",
+        "label": "Fastest floor (RPM)",
+        "defaultValue": 6500,
+        "minimum": 1200,
+        "maximum": 6500,
+        "description": "The floor requested at tempHigh. Lower it if full speed is louder than you can stand; the SMC can still go faster than this on its own if things get dire."
+      },
+      {
+        "key": "hysteresis",
+        "type": "integer",
+        "label": "Cool-down band (°C)",
+        "defaultValue": 8,
+        "minimum": 0,
+        "maximum": 20,
+        "description": "How far the temperature must fall before the fan is allowed to slow down. The fan speeds up immediately but slows only after the machine has really cooled. This needs to be wider than the temperature's own jitter — measured tick-to-tick swings here are around 8°C, and a narrower band makes the fan hunt."
+      },
+      {
+        "key": "interval",
+        "type": "integer",
+        "label": "Check every (seconds)",
+        "defaultValue": 5,
+        "minimum": 1,
+        "maximum": 60,
+        "description": "How often the daemon reads the sensors. Shorter reacts faster to a sudden load; the cost is negligible either way."
+      }
+    ]
+  }
+}

@@ -1,0 +1,209 @@
+#!/usr/bin/env bash
+#
+# omafan-daemon — raise the fan floor as the machine heats up.
+#
+# Runs as root under systemd on Apple hardware, where the SMC's own fan curve
+# is far too lazy under Linux: measured on a MacBookAir7,2, 45 seconds of load
+# took the CPU package from 67C to 90C while the fan stayed at ~1190 RPM and
+# never ramped. macOS shipped a userspace daemon to do this job; this is it.
+#
+# Control model: this writes fan1_min and NEVER touches fan1_manual. The SMC
+# keeps governing the fan; we only raise the floor it is allowed to idle at.
+# That choice is about the failure mode. If this process is killed, the fan
+# holds the last floor it was given -- loud at worst, never silent under load
+# -- and the SMC's own curve is still in circuit. Taking manual control would
+# invert that: a daemon that dies at a low RPM under load leaves nobody to
+# raise the fan.
+#
+# Settings are re-read from the config file on every tick, so the bar panel can
+# change the curve without root and without restarting this service. Every
+# value read from that file is clamped here, because the file is user-writable
+# and this process is not.
+
+set -uo pipefail
+
+CONF="${OMAFAN_CONF:-/etc/omafan/config}"
+TAG="omafan"
+
+log() { printf '%s\n' "$*"; }          # stdout; systemd routes it to the journal
+die() { printf '%s: %s\n' "$TAG" "$*" >&2; exit 1; }
+
+# --- hardware discovery -----------------------------------------------------
+# The applesmc platform address (applesmc.768 here) is not guaranteed, and the
+# driver hangs its attributes off the platform device rather than its hwmon
+# node -- the hwmon directory has no name file and no temp inputs at all. So
+# resolve the platform device, not hwmon.
+SMC=""
+for d in /sys/devices/platform/applesmc.*; do
+  [[ -e "$d/fan1_min" ]] && { SMC="$d"; break; }
+done
+[[ -n "$SMC" ]] || die "no applesmc fan found (is the applesmc module loaded?)"
+
+# Fan count: MacBook Airs have one, Pros have two.
+FANS=()
+for f in "$SMC"/fan[0-9]*_min; do
+  [[ -e "$f" ]] || continue
+  n="${f##*/fan}"; n="${n%%_*}"
+  FANS+=("$n")
+done
+[[ ${#FANS[@]} -gt 0 ]] || die "no writable fan floor under $SMC"
+
+HW_MIN="$(cat "$SMC/fan${FANS[0]}_min" 2>/dev/null || echo 1200)"
+HW_MAX="$(cat "$SMC/fan${FANS[0]}_max" 2>/dev/null || echo 6500)"
+# fan1_min is where we write, so at startup it may already hold OUR floor from
+# a previous run rather than the factory value. fan1_max is read-only and safe.
+# Take the factory floor from the unit's environment if the installer recorded
+# it, else assume the value we found is stock.
+FLOOR_STOCK="${OMAFAN_STOCK_MIN:-$HW_MIN}"
+
+# --- sensors ----------------------------------------------------------------
+# Measured on this hardware: the CPU die sensors (TC0E TC0F TC1C TC2C TCMX
+# TCSA TCXC) and coretemp's package all move together under load, +21 to +27C,
+# while memory (TM0P), SSD (TH0*) and skin (Ts0S) sensors move 1-3C and are
+# useless for a fan curve. Tracking the package plus the GPU (TCGC) covers both
+# heat sources without reading 33 files every tick.
+SENSORS=()
+for h in /sys/class/hwmon/hwmon*; do
+  [[ "$(cat "$h/name" 2>/dev/null)" == "coretemp" ]] || continue
+  for t in "$h"/temp*_input; do
+    [[ -e "$t" ]] || continue
+    [[ "$(cat "${t%_input}_label" 2>/dev/null)" == Package* ]] && SENSORS+=("$t")
+  done
+done
+for t in "$SMC"/temp*_input; do
+  [[ -e "$t" ]] || continue
+  case "$(cat "${t%_input}_label" 2>/dev/null)" in
+    TCGC*|TCXC*|TCMX*) SENSORS+=("$t") ;;
+  esac
+done
+[[ ${#SENSORS[@]} -gt 0 ]] || die "found no usable temperature sensor"
+
+hottest() { # -> degrees C
+  local max=0 v
+  for t in "${SENSORS[@]}"; do
+    v="$(cat "$t" 2>/dev/null)" || continue
+    [[ "$v" =~ ^-?[0-9]+$ ]] || continue
+    v=$(( v / 1000 ))
+    (( v > max )) && max=$v
+  done
+  printf '%s' "$max"
+}
+
+# --- configuration ----------------------------------------------------------
+declare -A CFG
+defaults() {
+  CFG[enabled]=1
+  CFG[tempLow]=65      # below this the fan is left at the stock floor
+  CFG[tempHigh]=92     # at or above this the floor is rpmMax
+  CFG[rpmMin]=$FLOOR_STOCK
+  CFG[rpmMax]=$HW_MAX
+  CFG[hysteresis]=8    # degrees the temperature must fall before stepping down
+  CFG[interval]=5      # seconds between ticks
+}
+
+clamp() { # value lo hi
+  local v=$1 lo=$2 hi=$3
+  (( v < lo )) && v=$lo
+  (( v > hi )) && v=$hi
+  printf '%s' "$v"
+}
+
+read_config() {
+  defaults
+  [[ -r "$CONF" ]] || return 0
+  local k v
+  # Deliberately a whitelist parser, not `source`: this file is written by an
+  # unprivileged panel and read by a root process.
+  while IFS='=' read -r k v; do
+    k="${k//[[:space:]]/}"; v="${v//[[:space:]]/}"
+    [[ -n "$k" && "$k" != \#* ]] || continue
+    [[ "$v" =~ ^[0-9]+$ ]] || continue
+    case "$k" in
+      enabled|tempLow|tempHigh|rpmMin|rpmMax|hysteresis|interval) CFG[$k]="$v" ;;
+    esac
+  done < "$CONF"
+
+  CFG[rpmMin]=$(clamp "${CFG[rpmMin]}" "$FLOOR_STOCK" "$HW_MAX")
+  CFG[rpmMax]=$(clamp "${CFG[rpmMax]}" "$FLOOR_STOCK" "$HW_MAX")
+  (( CFG[rpmMax] < CFG[rpmMin] )) && CFG[rpmMax]=${CFG[rpmMin]}
+  CFG[tempLow]=$(clamp "${CFG[tempLow]}" 30 99)
+  CFG[tempHigh]=$(clamp "${CFG[tempHigh]}" 31 100)
+  (( CFG[tempHigh] <= CFG[tempLow] )) && CFG[tempHigh]=$(( CFG[tempLow] + 1 ))
+  CFG[hysteresis]=$(clamp "${CFG[hysteresis]}" 0 20)
+  CFG[interval]=$(clamp "${CFG[interval]}" 1 60)
+}
+
+# --- the curve --------------------------------------------------------------
+floor_for() { # temp -> rpm, linear between (tempLow,rpmMin) and (tempHigh,rpmMax)
+  local t=$1 lo=${CFG[tempLow]} hi=${CFG[tempHigh]} rlo=${CFG[rpmMin]} rhi=${CFG[rpmMax]}
+  if (( t <= lo )); then printf '%s' "$rlo"; return; fi
+  if (( t >= hi )); then printf '%s' "$rhi"; return; fi
+  printf '%s' $(( rlo + ( (t - lo) * (rhi - rlo) ) / (hi - lo) ))
+}
+
+# --- actuation --------------------------------------------------------------
+CURRENT=-1
+ANCHOR=-999   # the temperature at which CURRENT was chosen
+set_floor() { # rpm
+  local rpm=$1 n
+  (( rpm == CURRENT )) && return 0
+  for n in "${FANS[@]}"; do
+    printf '%s\n' "$rpm" 2>/dev/null > "$SMC/fan${n}_min" \
+      || log "warning: could not write fan${n}_min (not running as root?)"
+  done
+  CURRENT=$rpm
+}
+
+restore() {
+  log "restoring stock fan floor ${FLOOR_STOCK} RPM"
+  local n
+  for n in "${FANS[@]}"; do
+    printf '%s\n' "$FLOOR_STOCK" 2>/dev/null > "$SMC/fan${n}_min" || true
+  done
+}
+# EXIT alone covers TERM/INT too, since the default handler exits; installing
+# both would run restore twice.
+trap 'exit 0' TERM INT
+trap 'restore' EXIT
+
+# --- main loop --------------------------------------------------------------
+read_config
+log "$TAG: $SMC, ${#FANS[@]} fan(s), floor ${FLOOR_STOCK}-${HW_MAX} RPM, ${#SENSORS[@]} sensors, config $CONF"
+
+while :; do
+  read_config
+
+  if (( CFG[enabled] == 0 )); then
+    set_floor "$FLOOR_STOCK"
+  else
+    temp="$(hottest)"
+    target="$(floor_for "$temp")"
+
+    # Rise at once; fall only after the machine has actually cooled by a full
+    # band, and then go to the speed the curve really asks for.
+    #
+    # The obvious implementation -- comparing against floor_for(temp +
+    # hysteresis) -- is wrong, and wrong in a way that hides: it has a fixed
+    # point. Whenever floor_for(temp + hysteresis) equals the current floor the
+    # comparison stops being able to lower it, so the fan parks there for good
+    # and the machine runs permanently as though it were `hysteresis` degrees
+    # hotter than it is. Measured: the floor sat at 2966 RPM for minutes with
+    # the CPU at 66C and the curve asking for 1396.
+    #
+    # So the band is measured against ANCHOR, the temperature at which the
+    # current floor was chosen, and crossing it applies the true target. That
+    # is a deadband; the other is a bias.
+    if (( CURRENT >= 0 )) && (( target < CURRENT )) \
+       && (( temp > ANCHOR - CFG[hysteresis] )); then
+      target=$CURRENT
+    fi
+
+    if (( target != CURRENT )); then
+      log "$(printf '%sC -> floor %s RPM' "$temp" "$target")"
+      ANCHOR=$temp
+    fi
+    set_floor "$target"
+  fi
+
+  sleep "${CFG[interval]}" & wait $! || true
+done

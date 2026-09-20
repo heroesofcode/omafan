@@ -1,0 +1,128 @@
+#!/usr/bin/env bash
+#
+# omafan-install — install (or remove) the root service that drives the fan.
+#
+# Run once, with sudo, from a terminal. Everything after this is unprivileged:
+# the panel edits the curve by writing the user's config file, and the daemon
+# re-reads it on the next tick.
+#
+#   sudo ./omafan-install
+#   sudo ./omafan-install --uninstall
+#
+# Why the daemon is copied out of ~/.config instead of run from there: this is
+# a root service. A unit whose ExecStart points into the user's home lets any
+# process running as that user rewrite what root executes. The copy lives in
+# /usr/local/lib/omafan owned by root, and re-running the installer refreshes
+# it after a plugin update.
+
+set -euo pipefail
+
+LIBDIR=/usr/local/lib/omafan
+UNIT=/etc/systemd/system/omafan.service
+SRC="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/omafan-daemon"
+
+[[ $EUID -eq 0 ]] || { echo "omafan-install: must run as root (use sudo)" >&2; exit 1; }
+
+# Who is this being installed for? The daemon reads that user's config file.
+TARGET_USER="${SUDO_USER:-}"
+if [[ -z $TARGET_USER && -n ${PKEXEC_UID:-} ]]; then
+  TARGET_USER="$(getent passwd "$PKEXEC_UID" | cut -d: -f1)"
+fi
+[[ -n $TARGET_USER ]] || { echo "omafan-install: cannot tell which user to install for; set SUDO_USER" >&2; exit 1; }
+TARGET_HOME="$(getent passwd "$TARGET_USER" | cut -d: -f6)"
+CONF="$TARGET_HOME/.config/omafan/config"
+
+if [[ ${1:-} == --uninstall ]]; then
+  systemctl disable --now omafan.service 2>/dev/null || true
+  rm -f "$UNIT"
+  rm -rf "$LIBDIR"
+  systemctl daemon-reload
+  echo "omafan-install: removed. The daemon restored the stock fan floor on stop."
+  exit 0
+fi
+
+[[ -f $SRC ]] || { echo "omafan-install: $SRC not found" >&2; exit 1; }
+
+SMC=""
+for d in /sys/devices/platform/applesmc.*; do
+  [[ -e "$d/fan1_min" ]] && { SMC="$d"; break; }
+done
+[[ -n $SMC ]] || { echo "omafan-install: no applesmc fan found; this machine is not supported" >&2; exit 1; }
+
+# The stock floor has to be captured before omafan ever raises it, or a
+# reinstall would record our own raised value as "stock" and the fan would
+# never come back down. If a previous unit recorded it, that record wins.
+STOCK=""
+if [[ -f $UNIT ]]; then
+  STOCK="$(sed -n '/^Environment=OMAFAN_STOCK_MIN=/{s///p;q}' "$UNIT")"
+fi
+if [[ -z $STOCK ]]; then
+  STOCK="$(cat "$SMC/fan1_min")"
+fi
+[[ "$STOCK" =~ ^[0-9]+$ ]] || STOCK=1200
+
+install -d -m 755 -o root -g root "$LIBDIR"
+install -m 755 -o root -g root "$SRC" "$LIBDIR/omafan-daemon"
+
+install -d -m 755 -o "$TARGET_USER" -g "$TARGET_USER" "$TARGET_HOME/.config/omafan"
+
+cat > "$UNIT" <<UNITEOF
+[Unit]
+Description=omafan — temperature-driven fan floor for Apple hardware
+Documentation=https://github.com/heroesofcode/omafan
+ConditionPathExistsGlob=/sys/devices/platform/applesmc.*
+
+[Service]
+Type=simple
+Environment=OMAFAN_CONF=$CONF
+Environment=OMAFAN_STOCK_MIN=$STOCK
+ExecStart=$LIBDIR/omafan-daemon
+Restart=always
+RestartSec=2
+
+# This runs as root for one reason: writing fan*_min under /sys. Everything
+# else root can normally do is taken away, so a bug here has as little reach as
+# the job allows.
+#
+# ProtectKernelTunables is deliberately NOT set. It would mount /sys read-only,
+# which is exactly the one thing this daemon exists to write, and the failure
+# would be quiet: the service starts, the curve computes, and the fan never
+# moves.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=yes
+PrivateNetwork=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=multi-user.target
+UNITEOF
+chmod 644 "$UNIT"
+
+systemctl daemon-reload
+systemctl enable omafan.service
+# `enable --now` starts the service only when it is stopped, so re-running the
+# installer to pick up a new daemon left the OLD process running against the
+# new file on disk -- omafan-doctor would report the copies as matching while
+# the fan obeyed code that no longer existed anywhere. `restart` starts it when
+# stopped and replaces it when running, which is what an idempotent installer
+# actually wants.
+systemctl restart omafan.service
+
+echo "omafan-install: installed for $TARGET_USER"
+echo "  daemon  $LIBDIR/omafan-daemon"
+echo "  unit    $UNIT"
+echo "  config  $CONF  (user-writable; the panel edits this)"
+echo "  stock fan floor recorded as ${STOCK} RPM"
+systemctl --no-pager --lines=5 status omafan.service || true

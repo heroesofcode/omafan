@@ -1,0 +1,196 @@
+#!/usr/bin/env bash
+#
+# omafan-doctor — check the whole chain, from kernel module to actual RPM.
+#
+# The last check is the one that matters. A service that is `active` and a
+# config file that parses prove nothing about the fan: the useful question is
+# whether the floor sitting in the hardware right now is the floor the curve
+# asks for at the temperature right now. Everything above it is there to tell
+# you where the chain broke when it is not.
+
+set -uo pipefail
+
+LIBDIR=/usr/local/lib/omafan
+UNIT=/etc/systemd/system/omafan.service
+CONF="${OMAFAN_CONF:-$HOME/.config/omafan/config}"
+HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+
+ok=0; bad=0
+pass() { printf '  \033[32m✓\033[0m %s\n' "$*"; ok=$((ok+1)); }
+fail() { printf '  \033[31m✗\033[0m %s\n' "$*"; bad=$((bad+1)); }
+info() { printf '    %s\n' "$*"; }
+
+echo "omafan-doctor"
+echo
+echo "hardware"
+grep -q '^applesmc ' /proc/modules && pass "applesmc module loaded" || fail "applesmc module not loaded"
+
+SMC=""
+for d in /sys/devices/platform/applesmc.*; do
+  [[ -e "$d/fan1_min" ]] && { SMC="$d"; break; }
+done
+if [[ -n $SMC ]]; then
+  pass "fan found at $SMC"
+  info "label   $(tr -d ' ' < "$SMC/fan1_label" 2>/dev/null)"
+  stock_min="$(sed -n '/^Environment=OMAFAN_STOCK_MIN=/{s///p;q}' "$UNIT" 2>/dev/null)"
+  [[ "$stock_min" =~ ^[0-9]+$ ]] || stock_min="$(cat "$SMC/fan1_min")"
+  info "range   ${stock_min} - $(cat "$SMC/fan1_max") RPM"
+  info "now     $(cat "$SMC/fan1_input") RPM, floor $(cat "$SMC/fan1_min"), manual=$(cat "$SMC/fan1_manual")"
+  [[ "$(cat "$SMC/fan1_manual")" == "0" ]] \
+    && pass "SMC still governing (fan1_manual=0, as omafan intends)" \
+    || fail "fan1_manual=1 — something took manual control; omafan never does this"
+else
+  fail "no applesmc fan — this machine is not supported"
+fi
+
+echo
+echo "service"
+[[ -x $LIBDIR/omafan-daemon ]] && pass "daemon installed at $LIBDIR/omafan-daemon" \
+  || fail "daemon not installed — run: sudo $HERE/omafan-install"
+if [[ -x $LIBDIR/omafan-daemon && -f $HERE/omafan-daemon ]]; then
+  cmp -s "$LIBDIR/omafan-daemon" "$HERE/omafan-daemon" \
+    && pass "installed daemon matches the plugin copy" \
+    || fail "installed daemon is STALE — re-run: sudo $HERE/omafan-install"
+fi
+[[ -f $UNIT ]] && pass "unit at $UNIT" || fail "no unit at $UNIT"
+if [[ -f $UNIT ]]; then
+  info "config  $(sed -n '/^Environment=OMAFAN_CONF=/{s///p;q}' "$UNIT")"
+  info "stock   $(sed -n '/^Environment=OMAFAN_STOCK_MIN=/{s///p;q}' "$UNIT") RPM"
+fi
+systemctl is-enabled --quiet omafan.service 2>/dev/null && pass "enabled at boot" || fail "not enabled at boot"
+systemctl is-active  --quiet omafan.service 2>/dev/null && pass "running" || fail "not running"
+
+# Comparing the installed file against the plugin's says nothing about the
+# process: `systemctl enable --now` leaves an already-running daemon alone, so
+# the file can be current while the running code is not. Compare the daemon's
+# start time against the file's mtime instead.
+if systemctl is-active --quiet omafan.service 2>/dev/null && [[ -f $LIBDIR/omafan-daemon ]]; then
+  started="$(systemctl show omafan.service -p ExecMainStartTimestamp --value 2>/dev/null)"
+  started_s="$(date -d "$started" +%s 2>/dev/null || echo 0)"
+  file_s="$(stat -c %Y "$LIBDIR/omafan-daemon" 2>/dev/null || echo 0)"
+  if (( started_s > 0 && file_s > started_s )); then
+    fail "the RUNNING daemon predates the installed file — restart it: sudo systemctl restart omafan"
+    info "started $started, file modified $(date -d "@$file_s" 2>/dev/null)"
+  elif (( started_s > 0 )); then
+    pass "the running daemon is the installed one"
+  fi
+fi
+
+echo
+echo "configuration"
+if [[ -r $CONF ]]; then
+  pass "config at $CONF"
+  sed -n 's/^\([a-zA-Z]*\)=\(.*\)$/    \1 = \2/p' "$CONF"
+else
+  info "no config at $CONF — the daemon is using its built-in defaults"
+fi
+
+echo
+echo "effect"
+if [[ -n $SMC ]] && systemctl is-active --quiet omafan.service 2>/dev/null; then
+  # Recompute what the curve asks for, from the same inputs the daemon uses.
+  declare -A C=( [tempLow]=65 [tempHigh]=92 [rpmMin]=1200 [rpmMax]=6500 [enabled]=1 [hysteresis]=8 )
+  if [[ -r $CONF ]]; then
+    while IFS='=' read -r k v; do
+      [[ "$v" =~ ^[0-9]+$ ]] || continue
+      case "$k" in enabled|tempLow|tempHigh|rpmMin|rpmMax|hysteresis) C[$k]=$v ;; esac
+    done < "$CONF"
+  fi
+  temp=0
+  for h in /sys/class/hwmon/hwmon*; do
+    [[ "$(cat "$h/name" 2>/dev/null)" == "coretemp" ]] || continue
+    for t in "$h"/temp*_input; do
+      [[ "$(cat "${t%_input}_label" 2>/dev/null)" == Package* ]] || continue
+      v=$(( $(cat "$t") / 1000 )); (( v > temp )) && temp=$v
+    done
+  done
+  for t in "$SMC"/temp*_input; do
+    case "$(cat "${t%_input}_label" 2>/dev/null)" in
+      TCGC*|TCXC*|TCMX*) v=$(( $(cat "$t") / 1000 )); (( v > temp )) && temp=$v ;;
+    esac
+  done
+
+  curve() { # temp -> rpm
+    local t=$1
+    if   (( t <= C[tempLow]  )); then printf '%s' "${C[rpmMin]}"
+    elif (( t >= C[tempHigh] )); then printf '%s' "${C[rpmMax]}"
+    else printf '%s' $(( C[rpmMin] + ( (t - C[tempLow]) * (C[rpmMax] - C[rpmMin]) ) / (C[tempHigh] - C[tempLow]) ))
+    fi
+  }
+
+  # Checking the floor against a single curve value is wrong twice over. The
+  # daemon read the sensors up to one interval ago and this CPU swings several
+  # degrees in that time; and while the machine is cooling the deadband is
+  # *supposed* to hold the floor above what the curve asks for right now. So
+  # the test is a band, not a point: anywhere between what the curve wants at
+  # this temperature and what it wanted a full hysteresis band hotter.
+  stock=$(sed -n '/^Environment=OMAFAN_STOCK_MIN=/{s///p;q}' "$UNIT" 2>/dev/null)
+  stock=${stock:-1200}
+
+  check_band() { # -> 0 in band, 1 outside; sets lo/hi/have/rpm
+    temp=0
+    for h in /sys/class/hwmon/hwmon*; do
+      [[ "$(cat "$h/name" 2>/dev/null)" == "coretemp" ]] || continue
+      for t in "$h"/temp*_input; do
+        [[ "$(cat "${t%_input}_label" 2>/dev/null)" == Package* ]] || continue
+        v=$(( $(cat "$t") / 1000 )); (( v > temp )) && temp=$v
+      done
+    done
+    for t in "$SMC"/temp*_input; do
+      case "$(cat "${t%_input}_label" 2>/dev/null)" in
+        TCGC*|TCXC*|TCMX*) v=$(( $(cat "$t") / 1000 )); (( v > temp )) && temp=$v ;;
+      esac
+    done
+    have="$(cat "$SMC/fan1_min")"
+    rpm="$(cat "$SMC/fan1_input")"
+    if (( C[enabled] == 0 )); then lo=$stock; hi=$stock
+    else
+      lo="$(curve $(( temp - C[hysteresis] )) )"
+      hi="$(curve $(( temp + C[hysteresis] )) )"
+    fi
+    (( have >= lo - 200 && have <= hi + 200 ))
+  }
+
+  if check_band; then
+    outcome=0
+  else
+    # One interval of grace, then decide.
+    sleep $(( ${C[interval]:-5} + 2 ))
+    check_band && outcome=0 || outcome=1
+  fi
+
+  info "hottest tracked sensor  ${temp}C"
+  if (( C[enabled] == 0 )); then
+    info "omafan is disabled in the config; expecting the stock floor of ${stock} RPM"
+  else
+    info "curve allows a floor of  ${lo} - ${hi} RPM at this temperature"
+  fi
+  info "hardware floor is       ${have} RPM"
+  info "fan is actually turning ${rpm} RPM"
+
+  if (( outcome == 0 )); then
+    pass "the floor in the hardware tracks the curve — omafan is really driving the fan"
+  else
+    fail "floor is ${have} RPM, outside the ${lo}-${hi} RPM the curve allows"
+    info "check: journalctl -u omafan -n 30"
+  fi
+  # A fan has mass. Right after the floor moves it is still accelerating, so a
+  # single slow reading means nothing -- re-read before calling it a fault.
+  if (( rpm + 300 < have )); then
+    sleep 6
+    rpm2="$(cat "$SMC/fan1_input")"
+    have2="$(cat "$SMC/fan1_min")"
+    if (( rpm2 + 300 < have2 )); then
+      fail "the fan is turning slower than its own floor — the SMC is ignoring fan1_min"
+      info "${rpm2} RPM against a floor of ${have2}, six seconds apart"
+    else
+      pass "the fan was still spinning up; it reached ${rpm2} RPM against a floor of ${have2}"
+    fi
+  fi
+else
+  info "skipped — needs the service running on supported hardware"
+fi
+
+echo
+printf '%s passed, %s failed\n' "$ok" "$bad"
+(( bad == 0 )) || exit 1

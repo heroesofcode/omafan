@@ -1,0 +1,111 @@
+#!/usr/bin/env bash
+#
+# omafan-apply — the only thing that writes the omafan config file.
+#
+# The bar panel shells out to this; you can also call it directly. Missing
+# keys fall back to the defaults, so partial objects are fine.
+#
+#   ./omafan-apply '{"tempLow":55,"rpmMax":6500}'
+#   echo '{"enabled":false}' | ./omafan-apply -
+#   ./omafan-apply --print          # show what would be written, write nothing
+#
+# Nothing here needs root. The daemon re-reads the file on its next tick, so a
+# change takes effect within one interval without restarting the service.
+
+set -euo pipefail
+
+CONF="${OMAFAN_CONF:-$HOME/.config/omafan/config}"
+
+# These defaults are duplicated in manifest.json, Model.js and omafan-daemon,
+# because each has to work when the others have not spoken. Change one, change
+# all four.
+def_enabled=true
+def_tempLow=65
+def_tempHigh=92
+def_rpmMin=1200
+def_rpmMax=6500
+def_hysteresis=8
+def_interval=5
+
+PRINT_ONLY=0
+JSON='{}'
+case "${1:---print}" in
+  --print) PRINT_ONLY=1 ;;
+  -)       JSON="$(cat)" ;;
+  *)       JSON="$1" ;;
+esac
+[[ ${2:-} == --print ]] && PRINT_ONLY=1
+
+command -v jq >/dev/null || { echo "omafan-apply: jq is required" >&2; exit 1; }
+echo "$JSON" | jq -e . >/dev/null 2>&1 || { echo "omafan-apply: not valid JSON" >&2; exit 1; }
+
+get() { # key default
+  local v
+  v="$(printf '%s' "$JSON" | jq -r --arg k "$1" '.[$k] // empty')"
+  [[ -n $v && $v != null ]] || v="$2"
+  printf '%s' "$v"
+}
+
+enabled="$(get enabled "$def_enabled")"
+case "$enabled" in true|1) enabled=1 ;; false|0) enabled=0 ;; *) enabled=1 ;; esac
+
+# Read the real limits off the hardware when it is there, so the file we write
+# never claims a speed this fan cannot reach. sysfs is world-readable, so this
+# needs no privilege. The daemon clamps again regardless -- it does not trust
+# this file.
+#
+# fan1_min is NOT the hardware minimum once omafan is running: it is where the
+# daemon writes, so it reports the current floor. Reading it as a lower bound
+# makes this a ratchet -- each save clamps rpmMin up to the floor the fan
+# happens to be at, the curve flattens into a horizontal line, and the fan can
+# never come back down. The factory value is the one the installer recorded in
+# the unit; fall back to sysfs only when there is no unit to ask.
+HW_MIN=$def_rpmMin
+HW_MAX=$def_rpmMax
+UNIT=/etc/systemd/system/omafan.service
+for d in /sys/devices/platform/applesmc.*; do
+  [[ -r "$d/fan1_max" ]] || continue
+  v="$(cat "$d/fan1_max" 2>/dev/null)"; [[ "$v" =~ ^[0-9]+$ ]] && HW_MAX=$v
+  v=""
+  [[ -r $UNIT ]] && v="$(sed -n '/^Environment=OMAFAN_STOCK_MIN=/{s///p;q}' "$UNIT")"
+  [[ "$v" =~ ^[0-9]+$ ]] || v="$(cat "$d/fan1_min" 2>/dev/null)"
+  [[ "$v" =~ ^[0-9]+$ ]] && HW_MIN=$v
+  break
+done
+
+clamp() { local v=$1 lo=$2 hi=$3 dflt=$4
+  [[ "$v" =~ ^[0-9]+$ ]] || v=$dflt
+  (( v < lo )) && v=$lo; (( v > hi )) && v=$hi; printf '%s' "$v"; }
+
+tempLow="$(clamp "$(get tempLow $def_tempLow)" 30 99 $def_tempLow)"
+tempHigh="$(clamp "$(get tempHigh $def_tempHigh)" 31 100 $def_tempHigh)"
+(( tempHigh <= tempLow )) && tempHigh=$(( tempLow + 1 ))
+rpmMin="$(clamp "$(get rpmMin $HW_MIN)" "$HW_MIN" "$HW_MAX" "$HW_MIN")"
+rpmMax="$(clamp "$(get rpmMax $HW_MAX)" "$HW_MIN" "$HW_MAX" "$HW_MAX")"
+(( rpmMax < rpmMin )) && rpmMax=$rpmMin
+hysteresis="$(clamp "$(get hysteresis $def_hysteresis)" 0 20 $def_hysteresis)"
+interval="$(clamp "$(get interval $def_interval)" 1 60 $def_interval)"
+
+render() {
+  cat <<CONFEOF
+# Written by omafan-apply — edits here are overwritten by the bar panel.
+# The daemon re-reads this file every tick and clamps every value to what the
+# hardware actually allows, so nothing in here can ask for an unsafe fan speed.
+enabled=$enabled
+tempLow=$tempLow
+tempHigh=$tempHigh
+rpmMin=$rpmMin
+rpmMax=$rpmMax
+hysteresis=$hysteresis
+interval=$interval
+CONFEOF
+}
+
+if (( PRINT_ONLY )); then render; exit 0; fi
+
+mkdir -p -- "$(dirname -- "$CONF")"
+tmp="$(mktemp "$(dirname -- "$CONF")/.omafan.XXXXXX")"
+render > "$tmp"
+chmod 644 "$tmp"
+mv -f "$tmp" "$CONF"
+echo "omafan-apply: wrote $CONF (${tempLow}C-${tempHigh}C -> ${rpmMin}-${rpmMax} RPM)"
