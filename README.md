@@ -7,6 +7,8 @@ macOS ran a userspace daemon that watched the temperature and leaned on the
 fan. Linux does not, and the SMC's own fallback curve is far too patient. The
 bar shows you the temperature; Omafan keeps it from getting there.
 
+![The Omafan panel in the Omarchy bar](preview.png)
+
 ## The measurement this exists for
 
 On the MacBookAir7,2 it was written on, 45 seconds of four-thread load:
