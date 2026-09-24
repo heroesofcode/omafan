@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.heroesofcode.omafan",
   "name": "Omafan",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "author": "heroesofcode",
   "license": "MIT",
   "description": "Temperature-driven fan control for Apple hardware running Linux, from the Omarchy bar. The SMC's own curve barely ramps under Linux — on a MacBookAir7,2 the CPU reaches 90°C with the fan still idling at 1200 RPM. Omafan raises the fan's floor as the machine heats up, and shows the temperature in the bar.",
