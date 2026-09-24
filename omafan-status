@@ -8,8 +8,12 @@
 
 set -uo pipefail
 
+# Empty in production; the test suite points it at a fake filesystem root. See
+# the comment on the same variable in omafan-daemon.
+SYSROOT="${OMAFAN_SYSROOT:-}"
+
 SMC=""
-for d in /sys/devices/platform/applesmc.*; do
+for d in "$SYSROOT"/sys/devices/platform/applesmc.*; do
   [[ -e "$d/fan1_min" ]] && { SMC="$d"; break; }
 done
 
@@ -19,7 +23,7 @@ if [[ -z $SMC ]]; then
 fi
 
 temp=0
-for h in /sys/class/hwmon/hwmon*; do
+for h in "$SYSROOT"/sys/class/hwmon/hwmon*; do
   [[ "$(cat "$h/name" 2>/dev/null)" == "coretemp" ]] || continue
   for t in "$h"/temp*_input; do
     [[ -e "$t" ]] || continue
@@ -36,7 +40,7 @@ done
 
 service=absent
 stock=""
-UNIT=/etc/systemd/system/omafan.service
+UNIT="$SYSROOT/etc/systemd/system/omafan.service"
 if [[ -f $UNIT ]]; then
   service=inactive
   systemctl is-active --quiet omafan.service 2>/dev/null && service=active
