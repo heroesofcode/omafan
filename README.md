@@ -130,6 +130,63 @@ omarchy plugin disable io.github.heroesofcode.omafan
 The daemon restores the factory floor when it stops, so uninstalling leaves the
 fan exactly as Omafan found it.
 
+## Tests
+
+```bash
+./tests/run              # everything, about half a minute
+./tests/run hysteresis   # only the tests whose name contains this
+```
+
+No CI runner has Apple hardware in it, so the suite builds a fake one: a
+temporary directory holding an `applesmc` platform device with writable fan
+floors, a `coretemp` hwmon, and a couple of hot sensors that are supposed to be
+ignored. Every script reads sysfs and the unit file through `$OMAFAN_SYSROOT`,
+empty in production, so they run against that tree unmodified.
+
+Two layers, because they catch different things. The daemon is **sourced**,
+which yields its discovery and its functions with no loop attached, and the
+curve, the clamps and the hysteresis band are then called directly with the
+values that once went wrong — the floor that parked at 2966 RPM among them.
+Then it is **run** against the fake tree with the temperature moved underneath
+it, which is the only way to see that a floor is really written, that a
+two-fan machine gets both, and that stopping the service puts the factory
+floor back.
+
+One test exists only to keep the four copies of the defaults — `manifest.json`,
+`Model.js`, `omafan-apply` and the daemon — from drifting apart. They are
+duplicated on purpose, because each has to work when the others have not
+spoken, and nothing but that test makes them agree.
+
+`shellcheck` and the suite run on every pull request, on Arch, which is what
+Omarchy is.
+
+## Releasing
+
+Versions are not edited by hand. release-please watches `main`, reads the
+commit messages, and keeps a release pull request open with the next version
+number and a generated `CHANGELOG.md`. Merging that PR tags the release and
+publishes it.
+
+So commit messages decide the version, and they follow
+[Conventional Commits](https://www.conventionalcommits.org):
+
+| Prefix | Effect |
+|---|---|
+| `fix:` | patch bump — 1.0.0 to 1.0.1 |
+| `feat:` | minor bump — 1.0.0 to 1.1.0 |
+| `feat!:` or a `BREAKING CHANGE:` footer | major bump — 1.0.0 to 2.0.0 |
+| `refactor:` `perf:` | patch bump, shown in the changelog |
+| `docs:` `ci:` `test:` `chore:` | no bump, not in the changelog |
+
+`manifest.json` is bumped by release-please through the `extra-files` rule in
+`release-please-config.json`; `.release-please-manifest.json` is where it
+remembers the current version. Neither is meant to be edited by hand.
+
+Pull requests are merged with **rebase**, so every commit message lands on
+`main` verbatim and every one of them is parsed. A stray `wip` commit in a
+branch becomes a stray `wip` commit in the history — squash locally first, or
+switch the repository to squash-merge so only the PR title counts.
+
 ## Things that are true and not obvious
 
 **`fan1_min` really does move the fan, with `fan1_manual` still `0`.** This is
@@ -173,6 +230,15 @@ floor*. Every save therefore raised the lower end of the curve to wherever the
 fan happened to be, until `rpmMin` and `rpmMax` met and the curve was a
 horizontal line at 5800 RPM — a fan at near-full speed that no temperature
 could bring down. Read the recorded stock value, never the live file.
+
+**`jq`'s `//` treats `false` as missing.** `.[$k] // empty` is the idiomatic
+way to ask jq for an optional key, and it was quietly wrong here: `//` takes
+the right-hand side for `false` as much as for `null`. So `{"enabled":false}` —
+which is exactly what the panel's off switch sends — read as *absent*, fell
+back to the default, and wrote `enabled=1`. The bar said the curve was off
+while the daemon went on driving the fan. Ask `has($k)` instead. The test suite
+found this; a year of using it would not have, because the only symptom is a
+fan that keeps working when you told it not to.
 
 **`applesmc`'s hwmon node is empty.** `/sys/class/hwmon/hwmonN` for this driver
 has no `name` file and no `temp*_input` at all — the attributes hang off the
