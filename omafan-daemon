@@ -25,6 +25,12 @@ set -uo pipefail
 CONF="${OMAFAN_CONF:-/etc/omafan/config}"
 TAG="omafan"
 
+# Every sysfs path below is read through this prefix. It is empty in production
+# and the paths are the real ones; the test suite points it at a directory
+# holding a fake /sys, which is what lets the curve, the clamps and the
+# restore-on-stop path run without Apple hardware under them.
+SYSROOT="${OMAFAN_SYSROOT:-}"
+
 log() { printf '%s\n' "$*"; }          # stdout; systemd routes it to the journal
 die() { printf '%s: %s\n' "$TAG" "$*" >&2; exit 1; }
 
@@ -34,7 +40,7 @@ die() { printf '%s: %s\n' "$TAG" "$*" >&2; exit 1; }
 # node -- the hwmon directory has no name file and no temp inputs at all. So
 # resolve the platform device, not hwmon.
 SMC=""
-for d in /sys/devices/platform/applesmc.*; do
+for d in "$SYSROOT"/sys/devices/platform/applesmc.*; do
   [[ -e "$d/fan1_min" ]] && { SMC="$d"; break; }
 done
 [[ -n "$SMC" ]] || die "no applesmc fan found (is the applesmc module loaded?)"
@@ -63,7 +69,7 @@ FLOOR_STOCK="${OMAFAN_STOCK_MIN:-$HW_MIN}"
 # useless for a fan curve. Tracking the package plus the GPU (TCGC) covers both
 # heat sources without reading 33 files every tick.
 SENSORS=()
-for h in /sys/class/hwmon/hwmon*; do
+for h in "$SYSROOT"/sys/class/hwmon/hwmon*; do
   [[ "$(cat "$h/name" 2>/dev/null)" == "coretemp" ]] || continue
   for t in "$h"/temp*_input; do
     [[ -e "$t" ]] || continue
@@ -141,9 +147,34 @@ floor_for() { # temp -> rpm, linear between (tempLow,rpmMin) and (tempHigh,rpmMa
   printf '%s' $(( rlo + ( (t - lo) * (rhi - rlo) ) / (hi - lo) ))
 }
 
-# --- actuation --------------------------------------------------------------
 CURRENT=-1
 ANCHOR=-999   # the temperature at which CURRENT was chosen
+
+# Rise at once; fall only after the machine has actually cooled by a full band,
+# and then go to the speed the curve really asks for.
+#
+# The obvious implementation -- comparing against floor_for(temp + hysteresis)
+# -- is wrong, and wrong in a way that hides: it has a fixed point. Whenever
+# floor_for(temp + hysteresis) equals the current floor the comparison stops
+# being able to lower it, so the fan parks there for good and the machine runs
+# permanently as though it were `hysteresis` degrees hotter than it is.
+# Measured: the floor sat at 2966 RPM for minutes with the CPU at 66C and the
+# curve asking for 1396.
+#
+# So the band is measured against ANCHOR, the temperature at which the current
+# floor was chosen, and crossing it applies the true target. That is a deadband;
+# the other is a bias.
+damped() { # temp target -> rpm
+  local temp=$1 target=$2
+  if (( CURRENT >= 0 )) && (( target < CURRENT )) \
+     && (( temp > ANCHOR - CFG[hysteresis] )); then
+    printf '%s' "$CURRENT"
+    return
+  fi
+  printf '%s' "$target"
+}
+
+# --- actuation --------------------------------------------------------------
 set_floor() { # rpm
   local rpm=$1 n
   (( rpm == CURRENT )) && return 0
@@ -161,49 +192,39 @@ restore() {
     printf '%s\n' "$FLOOR_STOCK" 2>/dev/null > "$SMC/fan${n}_min" || true
   done
 }
-# EXIT alone covers TERM/INT too, since the default handler exits; installing
-# both would run restore twice.
-trap 'exit 0' TERM INT
-trap 'restore' EXIT
 
 # --- main loop --------------------------------------------------------------
-read_config
-log "$TAG: $SMC, ${#FANS[@]} fan(s), floor ${FLOOR_STOCK}-${HW_MAX} RPM, ${#SENSORS[@]} sensors, config $CONF"
+main() {
+  # EXIT alone covers TERM/INT too, since the default handler exits; installing
+  # both would run restore twice.
+  trap 'exit 0' TERM INT
+  trap 'restore' EXIT
 
-while :; do
   read_config
+  log "$TAG: $SMC, ${#FANS[@]} fan(s), floor ${FLOOR_STOCK}-${HW_MAX} RPM, ${#SENSORS[@]} sensors, config $CONF"
 
-  if (( CFG[enabled] == 0 )); then
-    set_floor "$FLOOR_STOCK"
-  else
-    temp="$(hottest)"
-    target="$(floor_for "$temp")"
+  while :; do
+    read_config
 
-    # Rise at once; fall only after the machine has actually cooled by a full
-    # band, and then go to the speed the curve really asks for.
-    #
-    # The obvious implementation -- comparing against floor_for(temp +
-    # hysteresis) -- is wrong, and wrong in a way that hides: it has a fixed
-    # point. Whenever floor_for(temp + hysteresis) equals the current floor the
-    # comparison stops being able to lower it, so the fan parks there for good
-    # and the machine runs permanently as though it were `hysteresis` degrees
-    # hotter than it is. Measured: the floor sat at 2966 RPM for minutes with
-    # the CPU at 66C and the curve asking for 1396.
-    #
-    # So the band is measured against ANCHOR, the temperature at which the
-    # current floor was chosen, and crossing it applies the true target. That
-    # is a deadband; the other is a bias.
-    if (( CURRENT >= 0 )) && (( target < CURRENT )) \
-       && (( temp > ANCHOR - CFG[hysteresis] )); then
-      target=$CURRENT
+    if (( CFG[enabled] == 0 )); then
+      set_floor "$FLOOR_STOCK"
+    else
+      temp="$(hottest)"
+      target="$(damped "$temp" "$(floor_for "$temp")")"
+
+      if (( target != CURRENT )); then
+        log "$(printf '%sC -> floor %s RPM' "$temp" "$target")"
+        ANCHOR=$temp
+      fi
+      set_floor "$target"
     fi
 
-    if (( target != CURRENT )); then
-      log "$(printf '%sC -> floor %s RPM' "$temp" "$target")"
-      ANCHOR=$temp
-    fi
-    set_floor "$target"
-  fi
+    sleep "${CFG[interval]}" & wait $! || true
+  done
+}
 
-  sleep "${CFG[interval]}" & wait $! || true
-done
+# Sourced, this file is the discovery and the functions with no loop attached,
+# which is how the test suite gets at them. systemd runs it, so main starts.
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main
+fi

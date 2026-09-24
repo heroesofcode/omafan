@@ -16,6 +16,11 @@ set -euo pipefail
 
 CONF="${OMAFAN_CONF:-$HOME/.config/omafan/config}"
 
+# Prefix for the paths this reads off the machine -- sysfs and the unit file.
+# Empty in production; the test suite points it at a fake filesystem root, which
+# is how the clamping is exercised without Apple hardware under it.
+SYSROOT="${OMAFAN_SYSROOT:-}"
+
 # These defaults are duplicated in manifest.json, Model.js and omafan-daemon,
 # because each has to work when the others have not spoken. Change one, change
 # all four.
@@ -66,8 +71,8 @@ case "$enabled" in true|1) enabled=1 ;; false|0) enabled=0 ;; *) enabled=1 ;; es
 # the unit; fall back to sysfs only when there is no unit to ask.
 HW_MIN=$def_rpmMin
 HW_MAX=$def_rpmMax
-UNIT=/etc/systemd/system/omafan.service
-for d in /sys/devices/platform/applesmc.*; do
+UNIT="$SYSROOT/etc/systemd/system/omafan.service"
+for d in "$SYSROOT"/sys/devices/platform/applesmc.*; do
   [[ -r "$d/fan1_max" ]] || continue
   v="$(cat "$d/fan1_max" 2>/dev/null)"; [[ "$v" =~ ^[0-9]+$ ]] && HW_MAX=$v
   v=""
@@ -84,8 +89,8 @@ clamp() { local v=$1 lo=$2 hi=$3 dflt=$4
 tempLow="$(clamp "$(get tempLow $def_tempLow)" 30 99 $def_tempLow)"
 tempHigh="$(clamp "$(get tempHigh $def_tempHigh)" 31 100 $def_tempHigh)"
 (( tempHigh <= tempLow )) && tempHigh=$(( tempLow + 1 ))
-rpmMin="$(clamp "$(get rpmMin $HW_MIN)" "$HW_MIN" "$HW_MAX" "$HW_MIN")"
-rpmMax="$(clamp "$(get rpmMax $HW_MAX)" "$HW_MIN" "$HW_MAX" "$HW_MAX")"
+rpmMin="$(clamp "$(get rpmMin "$HW_MIN")" "$HW_MIN" "$HW_MAX" "$HW_MIN")"
+rpmMax="$(clamp "$(get rpmMax "$HW_MAX")" "$HW_MIN" "$HW_MAX" "$HW_MAX")"
 (( rpmMax < rpmMin )) && rpmMax=$rpmMin
 hysteresis="$(clamp "$(get hysteresis $def_hysteresis)" 0 20 $def_hysteresis)"
 interval="$(clamp "$(get interval $def_interval)" 1 60 $def_interval)"
