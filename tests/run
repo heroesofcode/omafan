@@ -1,0 +1,553 @@
+#!/usr/bin/env bash
+#
+# tests/run — the omafan test suite.
+#
+# Omafan drives Apple hardware that no CI runner has, so the suite builds a
+# fake filesystem root instead: an applesmc platform device with writable fan
+# floors, a coretemp hwmon with a package sensor, and a couple of sensors that
+# are supposed to be ignored. Every script reads sysfs and the unit file
+# through $OMAFAN_SYSROOT, so they run against that tree unmodified.
+#
+# Two layers, because they catch different things:
+#
+#   * the daemon is *sourced*, which yields its discovery and its functions
+#     with no loop attached, and the curve, the clamps and the hysteresis band
+#     are then called directly with the values that once went wrong;
+#   * the daemon is *run* against the fake tree with the temperature moved
+#     underneath it, which is the only way to see that a floor is really
+#     written, that it is written to every fan, and that stopping the service
+#     puts the factory floor back.
+#
+#   ./tests/run              # everything
+#   ./tests/run hysteresis   # only tests whose name contains this
+#
+# Needs bash and jq. Takes about half a minute: the daemon's shortest interval
+# is one second, so the end-to-end tests have to spend real time.
+
+set -uo pipefail
+
+cd "$(dirname "$0")/.." || exit 1
+
+FILTER="${1:-}"
+WORK="$(mktemp -d)"
+RESULTS="$WORK/results"
+: > "$RESULTS"
+trap 'rm -rf "$WORK"' EXIT
+
+if [[ -t 1 ]]; then
+  GREEN=$'\033[32m'; RED=$'\033[31m'; BOLD=$'\033[1m'; OFF=$'\033[0m'
+else
+  GREEN=""; RED=""; BOLD=""; OFF=""
+fi
+
+# --- assertions -------------------------------------------------------------
+# Tests run in subshells (sourcing the daemon sets shell options and globals,
+# and one test must not inherit another's), so the tally lives in a file.
+
+is() { # got want label
+  if [[ "$1" == "$2" ]]; then
+    printf 'ok\n' >> "$RESULTS"
+    printf '  %sok%s   %s\n' "$GREEN" "$OFF" "$3"
+  else
+    printf 'FAIL\n' >> "$RESULTS"
+    printf '  %sFAIL%s %s\n         got:  %s\n         want: %s\n' \
+      "$RED" "$OFF" "$3" "$1" "$2"
+  fi
+}
+
+matches() { # got regex label
+  if [[ "$1" =~ $2 ]]; then
+    printf 'ok\n' >> "$RESULTS"
+    printf '  %sok%s   %s\n' "$GREEN" "$OFF" "$3"
+  else
+    printf 'FAIL\n' >> "$RESULTS"
+    printf '  %sFAIL%s %s\n         got:    %s\n         expect: /%s/\n' \
+      "$RED" "$OFF" "$3" "$1" "$2"
+  fi
+}
+
+# --- the fake machine -------------------------------------------------------
+
+fake_root() { # [fan count] -> path to a filesystem root with an applesmc in it
+  local fans=${1:-1} n root smc hw
+  root="$(mktemp -d "$WORK/root.XXXXXX")"
+
+  # The platform device, not the hwmon node: applesmc's hwmon directory has no
+  # name file and no temperatures at all, which is the trap the daemon's
+  # discovery exists to avoid. The .768 suffix is not stable on real hardware.
+  smc="$root/sys/devices/platform/applesmc.768"
+  mkdir -p "$smc"
+  for ((n = 1; n <= fans; n++)); do
+    printf '1200\n' > "$smc/fan${n}_min"
+    printf '6500\n' > "$smc/fan${n}_max"
+    printf '1200\n' > "$smc/fan${n}_input"
+    printf '0\n'    > "$smc/fan${n}_manual"
+  done
+  printf 'TCGC\n'  > "$smc/temp1_label"; printf '50000\n' > "$smc/temp1_input"
+  printf 'TM0P\n'  > "$smc/temp2_label"; printf '99000\n' > "$smc/temp2_input"
+
+  hw="$root/sys/class/hwmon/hwmon0"
+  mkdir -p "$hw"
+  printf 'coretemp\n'     > "$hw/name"
+  printf 'Package id 0\n' > "$hw/temp1_label"; printf '50000\n' > "$hw/temp1_input"
+
+  # Something hot that is none of omafan's business, in both places a naive
+  # discovery would pick it up from.
+  mkdir -p "$root/sys/class/hwmon/hwmon1"
+  printf 'acpitz\n' > "$root/sys/class/hwmon/hwmon1/name"
+  printf '95000\n'  > "$root/sys/class/hwmon/hwmon1/temp1_input"
+
+  printf '%s' "$root"
+}
+
+smc_of()  { printf '%s' "$1/sys/devices/platform/applesmc.768"; }
+floor_of() { cat "$(smc_of "$1")/fan${2:-1}_min"; }
+
+set_temp() { # root degrees  -- the package sensor, which is what the curve sees
+  printf '%s\n' "$(( $2 * 1000 ))" > "$1/sys/class/hwmon/hwmon0/temp1_input"
+}
+
+write_unit() { # root stock_rpm  -- what omafan-install records
+  mkdir -p "$1/etc/systemd/system"
+  cat > "$1/etc/systemd/system/omafan.service" <<UNIT
+[Service]
+Environment=OMAFAN_STOCK_MIN=$2
+UNIT
+}
+
+wait_for() { # file value [seconds]
+  local f=$1 want=$2 s=${3:-8} i
+  for ((i = 0; i < s * 10; i++)); do
+    [[ "$(cat "$f" 2>/dev/null)" == "$want" ]] && return 0
+    sleep 0.1
+  done
+  return 1
+}
+
+holds() { # file value seconds  -- and does not move for that long
+  local f=$1 want=$2 s=$3 i
+  for ((i = 0; i < s * 5; i++)); do
+    [[ "$(cat "$f" 2>/dev/null)" == "$want" ]] || return 1
+    sleep 0.2
+  done
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# discovery
+# ---------------------------------------------------------------------------
+
+test_discovery() {
+  local root; root="$(fake_root 2)"
+  (
+    export OMAFAN_SYSROOT="$root" OMAFAN_CONF="$root/nope"
+    source ./omafan-daemon
+
+    is "${#FANS[@]}" 2 "both fans of a two-fan machine are found"
+    is "$SMC" "$(smc_of "$root")" "the platform device is resolved, not hwmon"
+    is "$HW_MAX" 6500 "the hardware maximum is read off fan1_max"
+    is "$FLOOR_STOCK" 1200 "the factory floor is the fan1_min found at startup"
+
+    # Package + TCGC. The 99C memory sensor and the 95C acpitz must not be in
+    # there: a fan curve that follows either is a fan that never stops.
+    is "${#SENSORS[@]}" 2 "only the two tracked sensors are picked up"
+    printf '70000\n' > "$root/sys/class/hwmon/hwmon0/temp1_input"
+    printf '80000\n' > "$(smc_of "$root")/temp1_input"
+    is "$(hottest)" 80 "the hottest tracked sensor wins, ignoring memory and acpitz"
+  )
+}
+
+test_discovery_absent() {
+  local root out rc; root="$(mktemp -d "$WORK/bare.XXXXXX")"
+  out="$(OMAFAN_SYSROOT="$root" ./omafan-daemon 2>&1)"; rc=$?
+  is "$rc" 1 "a machine with no applesmc exits non-zero"
+  matches "$out" "no applesmc fan found" "and says why"
+}
+
+# ---------------------------------------------------------------------------
+# the curve
+# ---------------------------------------------------------------------------
+
+test_curve() {
+  local root; root="$(fake_root)"
+  (
+    export OMAFAN_SYSROOT="$root" OMAFAN_CONF="$root/nope"
+    source ./omafan-daemon
+    read_config   # no file: the defaults, 65C-92C over 1200-6500 RPM
+
+    is "$(floor_for 40)" 1200 "well below the ramp the fan is left at the floor"
+    is "$(floor_for 65)" 1200 "at tempLow exactly, still the floor"
+    is "$(floor_for 66)" 1396 "one degree in, the ramp has started"
+    is "$(floor_for 78)" 3751 "halfway up, halfway along the line"
+    is "$(floor_for 84)" 4929 "and linear all the way"
+    is "$(floor_for 92)" 6500 "at tempHigh, full speed"
+    is "$(floor_for 99)" 6500 "and above it, no more than full speed"
+  )
+}
+
+# ---------------------------------------------------------------------------
+# the hysteresis band
+#
+# This is the regression that matters most. The band is measured against the
+# temperature at which the current floor was chosen (ANCHOR), never against a
+# shifted temperature -- a shifted temperature has a fixed point and parks the
+# fan at a high floor forever.
+# ---------------------------------------------------------------------------
+
+test_hysteresis() {
+  local root; root="$(fake_root)"
+  (
+    export OMAFAN_SYSROOT="$root" OMAFAN_CONF="$root/nope"
+    source ./omafan-daemon
+    read_config
+
+    CURRENT=-1; ANCHOR=-999
+    is "$(damped 60 1200)" 1200 "the first tick applies the curve as it is"
+
+    CURRENT=5000; ANCHOR=90
+    is "$(damped 95 6500)" 6500 "a rising temperature is obeyed at once"
+    is "$(damped 88 3000)" 5000 "a small drop inside the band changes nothing"
+    is "$(damped 83 3000)" 5000 "one degree short of the band, still nothing"
+    is "$(damped 82 3000)" 3000 "crossing the band applies the real target"
+    is "$(damped 70 2181)" 2181 "and a big drop goes all the way, not one step"
+
+    # The fixed point of the wrong implementation: with the floor at 2966 and
+    # the curve asking for 1396, comparing against floor_for(temp + band) can
+    # never lower it again. Against the anchor it can.
+    CURRENT=2966; ANCHOR=74
+    is "$(damped 66 1396)" 1396 "the floor that once parked at 2966 RPM comes down"
+  )
+}
+
+# ---------------------------------------------------------------------------
+# the config file: written by an unprivileged panel, read by a root process
+# ---------------------------------------------------------------------------
+
+test_config_clamps() {
+  local root conf; root="$(fake_root)"; conf="$WORK/clamps.conf"
+  cat > "$conf" <<CONF
+tempLow=999
+tempHigh=5
+rpmMin=1
+rpmMax=999999
+hysteresis=50
+interval=0
+CONF
+  (
+    export OMAFAN_SYSROOT="$root" OMAFAN_CONF="$conf"
+    source ./omafan-daemon
+    read_config
+
+    is "${CFG[tempLow]}"    99 "an absurd tempLow is clamped to the top of its range"
+    is "${CFG[tempHigh]}"  100 "and tempHigh is pushed above it rather than crossing"
+    is "${CFG[rpmMin]}"   1200 "rpmMin cannot go below the factory floor"
+    is "${CFG[rpmMax]}"   6500 "rpmMax cannot go above what the fan can do"
+    is "${CFG[hysteresis]}" 20 "the band is capped"
+    is "${CFG[interval]}"    1 "and the interval never reaches zero"
+  )
+}
+
+test_config_parser() {
+  local root conf; root="$(fake_root)"; conf="$WORK/hostile.conf"
+  cat > "$conf" <<'CONF'
+# a comment
+tempLow=70
+PATH=/tmp/evil
+rm=-rf /
+enabled=$(touch /tmp/omafan-pwned)
+tempHigh=`id`
+interval=5s
+  hysteresis = 4
+CONF
+  (
+    export OMAFAN_SYSROOT="$root" OMAFAN_CONF="$conf"
+    source ./omafan-daemon
+    read_config
+
+    is "${CFG[tempLow]}"      70 "a good key is read"
+    is "${CFG[hysteresis]}"    4 "whitespace around a value is not a problem"
+    is "${CFG[tempHigh]}"     92 "a command substitution is not a number, so it is ignored"
+    is "${CFG[enabled]}"       1 "nor is one that would have run something"
+    is "${CFG[interval]}"      5 "'5s' is not an integer either"
+    is "${#CFG[@]}"            7 "and no key outside the whitelist ever reaches the daemon"
+  )
+  is "$(ls /tmp/omafan-pwned 2>/dev/null)" "" "and nothing in the file was executed"
+}
+
+test_config_missing() {
+  local root; root="$(fake_root)"
+  (
+    export OMAFAN_SYSROOT="$root" OMAFAN_CONF="$root/not/there"
+    source ./omafan-daemon
+    read_config
+    is "${CFG[enabled]}"     1 "with no config file at all, the daemon still runs"
+    is "${CFG[tempLow]}"    65 "on the documented defaults"
+    is "${CFG[rpmMax]}"   6500 "with the range the hardware reports"
+  )
+}
+
+# ---------------------------------------------------------------------------
+# the daemon, running
+# ---------------------------------------------------------------------------
+
+test_daemon_drives_the_fan() {
+  local root conf log pid smc; root="$(fake_root)"
+  conf="$WORK/run.conf"; log="$WORK/run.log"
+  smc="$(smc_of "$root")"
+  cat > "$conf" <<CONF
+enabled=1
+tempLow=65
+tempHigh=92
+rpmMin=1200
+rpmMax=6500
+hysteresis=8
+interval=1
+CONF
+
+  set_temp "$root" 50
+  OMAFAN_SYSROOT="$root" OMAFAN_CONF="$conf" ./omafan-daemon > "$log" 2>&1 &
+  pid=$!
+
+  holds "$smc/fan1_min" 1200 2
+  is "$(floor_of "$root")" 1200 "a cool machine is left at the factory floor"
+
+  set_temp "$root" 92
+  wait_for "$smc/fan1_min" 6500
+  is "$(floor_of "$root")" 6500 "reaching tempHigh puts the floor at full speed"
+
+  set_temp "$root" 86
+  holds "$smc/fan1_min" 6500 3
+  is "$(floor_of "$root")" 6500 "cooling by less than the band does not slow the fan"
+
+  set_temp "$root" 84
+  wait_for "$smc/fan1_min" 4929
+  is "$(floor_of "$root")" 4929 "crossing the band drops the floor to the curve"
+
+  printf 'enabled=0\n' >> "$conf"
+  wait_for "$smc/fan1_min" 1200
+  is "$(floor_of "$root")" 1200 "turning the curve off hands the fan back, no restart"
+
+  # The config is re-read every tick, so this needs no root and no systemctl.
+  printf 'enabled=1\n' >> "$conf"
+  wait_for "$smc/fan1_min" 4929
+  is "$(floor_of "$root")" 4929 "and turning it back on picks the curve up again"
+
+  kill -TERM "$pid" 2>/dev/null
+  wait "$pid" 2>/dev/null
+  is "$(floor_of "$root")" 1200 "stopping the service restores the factory floor"
+  matches "$(cat "$log")" "restoring stock fan floor" "and says so in the journal"
+}
+
+test_daemon_two_fans() {
+  local root conf log pid smc; root="$(fake_root 2)"
+  conf="$WORK/two.conf"; log="$WORK/two.log"
+  smc="$(smc_of "$root")"
+  printf 'interval=1\n' > "$conf"
+
+  set_temp "$root" 95
+  OMAFAN_SYSROOT="$root" OMAFAN_CONF="$conf" ./omafan-daemon > "$log" 2>&1 &
+  pid=$!
+
+  wait_for "$smc/fan2_min" 6500
+  is "$(floor_of "$root" 1)" 6500 "on a two-fan machine the first fan is driven"
+  is "$(floor_of "$root" 2)" 6500 "and so is the second"
+
+  kill -TERM "$pid" 2>/dev/null
+  wait "$pid" 2>/dev/null
+  is "$(floor_of "$root" 2)" 1200 "both are restored on stop"
+
+  is "$(cat "$smc/fan1_manual")" 0 "fan1_manual is never touched"
+}
+
+# ---------------------------------------------------------------------------
+# omafan-apply, the only thing that writes the config file
+# ---------------------------------------------------------------------------
+
+apply() { # root json... -> the file it wrote
+  local root=$1; shift
+  OMAFAN_SYSROOT="$root" OMAFAN_CONF="$WORK/applied.conf" ./omafan-apply "$@" >/dev/null
+  cat "$WORK/applied.conf" 2>/dev/null
+}
+
+value_of() { # key <<< config
+  sed -n "s/^$1=//p"
+}
+
+test_apply_defaults() {
+  local root out; root="$(fake_root)"
+  out="$(apply "$root" '{}')"
+  is "$(value_of tempLow <<< "$out")"      65 "an empty object writes the default curve"
+  is "$(value_of tempHigh <<< "$out")"     92 "and the top of it"
+  is "$(value_of rpmMin <<< "$out")"     1200 "with the factory floor as the bottom"
+  is "$(value_of rpmMax <<< "$out")"     6500 "and the hardware maximum as the top"
+  is "$(value_of enabled <<< "$out")"       1 "and the curve switched on"
+
+  out="$(apply "$root" '{"tempLow":55}')"
+  is "$(value_of tempLow <<< "$out")"      55 "a partial object sets what it names"
+  is "$(value_of hysteresis <<< "$out")"    8 "and leaves the rest at the defaults"
+
+  out="$(apply "$root" '{"enabled":false,"tempLow":80,"tempHigh":70}')"
+  is "$(value_of enabled <<< "$out")"       0 "false is written as 0"
+  is "$(value_of tempHigh <<< "$out")"     81 "and tempHigh is never left under tempLow"
+}
+
+# The ratchet. fan1_min is where the daemon writes, so once omafan is running
+# it reports the current floor, not the factory one. Clamping rpmMin against it
+# raised the bottom of the curve on every save until the curve was a horizontal
+# line at near-full speed that no temperature could bring down. The factory
+# value is the one the installer recorded in the unit.
+test_apply_is_not_a_ratchet() {
+  local root out; root="$(fake_root)"
+  write_unit "$root" 1200
+  printf '5800\n' > "$(smc_of "$root")/fan1_min"   # the daemon is running hard
+
+  out="$(apply "$root" '{}')"
+  is "$(value_of rpmMin <<< "$out")" 1200 "rpmMin comes from the recorded stock floor, not the live one"
+  is "$(value_of rpmMax <<< "$out")" 6500 "so the curve keeps its whole range"
+}
+
+test_apply_reads_the_hardware() {
+  local root out; root="$(fake_root)"
+  printf '6000\n' > "$(smc_of "$root")/fan1_max"   # a fan that cannot reach 6500
+
+  out="$(apply "$root" '{"rpmMax":6500}')"
+  is "$(value_of rpmMax <<< "$out")" 6000 "a speed the fan cannot reach is clamped to what it can"
+}
+
+test_apply_rejects_junk() {
+  local root out rc; root="$(fake_root)"
+  apply "$root" '{"tempLow":55}' >/dev/null
+
+  out="$(OMAFAN_SYSROOT="$root" OMAFAN_CONF="$WORK/applied.conf" \
+        ./omafan-apply 'not json at all' 2>&1)"; rc=$?
+  is "$rc" 1 "invalid JSON is refused"
+  matches "$out" "not valid JSON" "with a message that says what is wrong"
+  is "$(value_of tempLow < "$WORK/applied.conf")" 55 "and the existing config is left alone"
+}
+
+test_apply_print_writes_nothing() {
+  local root out; root="$(fake_root)"
+  rm -f "$WORK/print.conf"
+  out="$(OMAFAN_SYSROOT="$root" OMAFAN_CONF="$WORK/print.conf" \
+        ./omafan-apply '{"tempLow":55}' --print)"
+  is "$(value_of tempLow <<< "$out")" 55 "--print renders the file it would write"
+  is "$(ls "$WORK/print.conf" 2>/dev/null)" "" "and writes nothing"
+}
+
+# ---------------------------------------------------------------------------
+# omafan-status, which the bar polls
+# ---------------------------------------------------------------------------
+
+status_of() { OMAFAN_SYSROOT="$1" ./omafan-status; }
+
+test_status_unsupported() {
+  local root out; root="$(mktemp -d "$WORK/bare.XXXXXX")"
+  out="$(status_of "$root")"
+  is "$(jq -r .supported <<< "$out")" false "a machine with no applesmc reports unsupported"
+  is "$(jq -r 'keys | length' <<< "$out")" 1 "and nothing else, so the bar can say so plainly"
+}
+
+test_status_reports_the_fan() {
+  local root out; root="$(fake_root)"
+  printf '3200\n' > "$(smc_of "$root")/fan1_input"
+  printf '2500\n' > "$(smc_of "$root")/fan1_min"
+  set_temp "$root" 71
+
+  out="$(status_of "$root")"
+  is "$(jq -r .supported <<< "$out")" true  "supported hardware is reported as such"
+  is "$(jq -r .temp  <<< "$out")"       71  "the temperature is the hottest tracked sensor"
+  is "$(jq -r .rpm   <<< "$out")"     3200  "the RPM is what the fan is really turning"
+  is "$(jq -r .floor <<< "$out")"     2500  "the floor is what omafan asked for"
+  is "$(jq -r .max   <<< "$out")"     6500  "the top of the range comes off the hardware"
+  is "$(jq -r .manual <<< "$out")"       0  "and manual control is reported, because it must stay 0"
+  is "$(jq -r .service <<< "$out")" absent  "with no unit installed, the service is absent"
+  is "$(jq -r .min <<< "$out")"       2500  "and the floor is the only stock value there is to report"
+
+  # Once the unit exists, the stock floor is the recorded one -- the live
+  # fan1_min is omafan's own floor and would be a lie.
+  write_unit "$root" 1200
+  out="$(status_of "$root")"
+  is "$(jq -r .min <<< "$out")" 1200 "once installed, the stock floor is the recorded one"
+  matches "$(jq -r .service <<< "$out")" "^(active|inactive)$" "and the service state is real"
+}
+
+# ---------------------------------------------------------------------------
+# the four copies of the defaults
+#
+# manifest.json, Model.js, omafan-apply and omafan-daemon each carry the same
+# defaults on purpose: each has to work when the others have not spoken. That
+# only holds while they agree, and nothing but this test makes them.
+# ---------------------------------------------------------------------------
+
+test_defaults_agree() {
+  local root from_manifest from_model from_apply from_daemon
+  root="$(fake_root)"
+
+  normalise() { sed 's/[[:space:]]//g; s/=true$/=1/; s/=false$/=0/' | sort; }
+
+  from_manifest="$(jq -r '.barWidget.defaults | to_entries[] | "\(.key)=\(.value)"' \
+              manifest.json | normalise)"
+
+  from_model="$(sed -n '/^var DEFAULTS = {/,/^}/p' Model.js \
+           | sed 's://.*::' \
+           | grep -oE '^[[:space:]]*[a-zA-Z]+:[[:space:]]*[a-z0-9]+' \
+           | tr ':' '=' | normalise)"
+
+  from_apply="$(grep -E '^def_[a-zA-Z]+=' omafan-apply | sed 's/^def_//' | normalise)"
+
+  # The daemon's rpm defaults come from the hardware it finds, which in the
+  # fake root is the 1200-6500 of the machine the others are written for.
+  from_daemon="$(
+    export OMAFAN_SYSROOT="$root" OMAFAN_CONF="$root/nope"
+    source ./omafan-daemon
+    defaults
+    for k in "${!CFG[@]}"; do printf '%s=%s\n' "$k" "${CFG[$k]}"; done | normalise
+  )"
+
+  is "$from_manifest" "$from_daemon" "manifest.json carries the same defaults as the daemon"
+  is "$from_model"    "$from_daemon" "Model.js carries the same defaults as the daemon"
+  is "$from_apply"    "$from_daemon" "omafan-apply carries the same defaults as the daemon"
+}
+
+# ---------------------------------------------------------------------------
+
+TESTS=(
+  discovery
+  discovery_absent
+  curve
+  hysteresis
+  config_clamps
+  config_parser
+  config_missing
+  daemon_drives_the_fan
+  daemon_two_fans
+  apply_defaults
+  apply_is_not_a_ratchet
+  apply_reads_the_hardware
+  apply_rejects_junk
+  apply_print_writes_nothing
+  status_unsupported
+  status_reports_the_fan
+  defaults_agree
+)
+
+command -v jq >/dev/null || { printf 'tests: jq is required\n' >&2; exit 1; }
+
+ran=0
+for t in "${TESTS[@]}"; do
+  [[ -z $FILTER || $t == *"$FILTER"* ]] || continue
+  ran=$(( ran + 1 ))
+  printf '%s%s%s\n' "$BOLD" "${t//_/ }" "$OFF"
+  "test_$t"
+done
+
+(( ran > 0 )) || { printf 'tests: nothing matched %q\n' "$FILTER" >&2; exit 1; }
+
+total="$(wc -l < "$RESULTS")"
+failed="$(grep -c '^FAIL' "$RESULTS")"
+printf '\n'
+if (( failed > 0 )); then
+  printf '%s%s of %s checks failed%s\n' "$RED" "$failed" "$total" "$OFF"
+  exit 1
+fi
+printf '%s%s checks passed%s\n' "$GREEN" "$total" "$OFF"

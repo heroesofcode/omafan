@@ -1,0 +1,9 @@
+# The `A && pass "..." || fail "..."` lines in omafan-doctor are a report, not an
+# if-then-else. The middle command is `pass`, which is a printf and cannot fail,
+# so the right-hand side runs only when the test itself failed.
+disable=SC2015
+
+# tests/run deliberately runs each case in a subshell: sourcing omafan-daemon
+# sets shell options and globals, and one test must not inherit another's. The
+# exported OMAFAN_SYSROOT/OMAFAN_CONF are meant to be local to it.
+disable=SC2030,SC2031
