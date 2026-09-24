@@ -1,0 +1,35 @@
+name: test
+
+# Pull requests are the gate: main is protected and only moves through one.
+# Also runs on main itself so the default branch keeps a visible status.
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    # Arch, because that is what Omarchy is. Nothing here is compiled, but the
+    # scripts run against the distribution's bash, jq and coreutils, and those
+    # are the versions a user of this plugin actually has.
+    container: archlinux:base-devel
+
+    steps:
+      # Before checkout: the action needs git, and the image has none of these.
+      - name: Install the tools the scripts need
+        run: pacman -Syu --noconfirm --needed git jq shellcheck
+
+      - uses: actions/checkout@v7
+
+      - name: Lint every script
+        run: shellcheck omafan-* tests/run
+
+      - name: Check the manifest parses
+        run: jq -e . manifest.json > /dev/null
+
+      # Builds a fake applesmc under a temporary root and runs the real daemon
+      # against it, so the curve, the clamps and the restore-on-stop path are
+      # exercised on a machine with no Apple hardware in it.
+      - name: Run the test suite
+        run: ./tests/run
