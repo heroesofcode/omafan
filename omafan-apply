@@ -41,7 +41,11 @@ echo "$JSON" | jq -e . >/dev/null 2>&1 || { echo "omafan-apply: not valid JSON" 
 
 get() { # key default
   local v
-  v="$(printf '%s' "$JSON" | jq -r --arg k "$1" '.[$k] // empty')"
+  # Not `.[$k] // empty`: jq's // takes the right-hand side for false as well as
+  # for null, so {"enabled":false} fell back to the default and the panel's off
+  # switch wrote enabled=1. Ask whether the key is there instead.
+  v="$(printf '%s' "$JSON" | jq -r --arg k "$1" \
+       'if has($k) and .[$k] != null then .[$k] else empty end')"
   [[ -n $v && $v != null ]] || v="$2"
   printf '%s' "$v"
 }
